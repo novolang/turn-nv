@@ -1,0 +1,27 @@
+[package]
+name        = "turn-nv"
+version     = "0.1.0"
+description = "A TURN client for novo-lang, RFC 8656, as a session a caller drives over datagrams it moves itself: Allocate, Refresh, CreatePermission and ChannelBind transactions over the STUN messages of stun-nv, the TURN attributes including EVEN-PORT, RESERVATION-TOKEN, ADDITIONAL-ADDRESS-FAMILY, ADDRESS-ERROR-CODE and ICMP, the long-term credential retries for 401 and 438, the lifetimes of allocations, permissions and channels counted from caller-supplied time, Send and Data indications, and ChannelData with its padding on a stream. Over buffers the caller owns, with no allocation and no sockets. A TURN server is not implemented and says so."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["turn", "rfc8656", "stun", "relay", "nat", "webrtc", "ice", "channeldata", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/turn-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Relaying media through a TURN server, as a session the caller drives"
+
+[dependencies]
+# stun-nv holds the STUN message of RFC 8489 (the header, the attributes, the
+# transaction ID and the address forms), the long-term credential key and the
+# MESSAGE-INTEGRITY check, the retransmission timer of a transaction, and the
+# method and attribute numbers of RFC 8656 with the ChannelData frame.  This
+# package adds the TURN attributes it lacks and the session that keeps many
+# transactions, permissions and channels at once.
+stun-nv = "^0.1.0"

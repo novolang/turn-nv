@@ -1,0 +1,177 @@
+// turnattr_tests.nv — the TURN attributes of RFC 8656 section 18 that this
+// package builds and reads, to bytes worked out by hand.
+//
+// THE BYTES ARE DERIVED FROM THE FIGURES OF THE RFC, not recorded from this
+// code.  An attribute is a 16-bit type, a 16-bit length of the value, the
+// value, and padding to a multiple of four.  Each test says its derivation.
+//
+//   REQUESTED-ADDRESS-FAMILY (0x0017, Figure 7): length 4, the family 0x02 for
+//   IPv6 and three reserved zero bytes: 00 17 00 04 02 00 00 00.
+//
+//   ADDITIONAL-ADDRESS-FAMILY (0x8000, section 18.11), the same value:
+//   80 00 00 04 02 00 00 00.
+//
+//   ADDRESS-ERROR-CODE (0x8001, Figure 10), the family 0x02, a reserved byte
+//   0, the class 5 in the low three bits of the third byte and the number 8
+//   for 508, and the reason "Insufficient Capacity", 21 bytes.  The length is
+//   4 + 21 = 25 = 0x19 and three bytes of padding follow:
+//   80 01 00 19 02 00 05 08 "Insufficient Capacity" 00 00 00.
+//
+//   ICMP (0x8004, Figure 11), two reserved bytes, the type 3 and the code 4
+//   of a destination-unreachable "fragmentation needed", and the MTU 1400 =
+//   0x00000578 as the error data: 80 04 00 08 00 00 03 04 00 00 05 78.
+
+use std.str
+use std.test
+use stunwire
+use turnwire
+use turnattr
+
+fn id() -> stunwire.StunTxid
+    stunwire.txid(0x0102030405060708, 0x090A0B0C)
+
+fn fresh() -> stunwire.StunMsg
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_REQUEST, turnwire.TURN_ALLOCATE, id())
+    m
+
+// The bytes of a message from index `from` to its end, as decimal numbers.
+fn bytes_from(var m: stunwire.StunMsg, from: Int) -> Str
+    var s = ""
+    for i in from..m.len()
+        s = s + str.from_int(m[i] as Int) + " "
+    s
+
+@test
+fn test_requested_and_additional_family_follow_figure_7() [io]
+    var m = fresh()
+    test.assert(turnattr.add_requested_family(var m, stunwire.STUN_FAMILY_IPV6))
+    test.assert_eq(bytes_from(var m, 20), "0 23 0 4 2 0 0 0 ")
+    var n = fresh()
+    test.assert(turnattr.add_additional_family(var n, stunwire.STUN_FAMILY_IPV6))
+    test.assert_eq(bytes_from(var n, 20), "128 0 0 4 2 0 0 0 ")
+    test.case("the readers give back the family, and 0 when the attribute is absent")
+    let hm = stunwire.parse(var m)
+    let hn = stunwire.parse(var n)
+    test.assert_eq(turnattr.read_requested_family(var m, hm), 2)
+    test.assert_eq(turnattr.read_additional_family(var n, hn), 2)
+    test.assert_eq(turnattr.read_requested_family(var n, hn), 0)
+    test.assert_eq(turnattr.read_additional_family(var m, hm), 0)
+    test.case("IPv4 is valid for the first and not for the second; anything else for neither")
+    var v4 = fresh()
+    test.assert(turnattr.add_requested_family(var v4, stunwire.STUN_FAMILY_IPV4))
+    test.assert(not turnattr.add_additional_family(var v4, stunwire.STUN_FAMILY_IPV4))
+    test.assert(not turnattr.add_requested_family(var v4, 0))
+    test.assert(not turnattr.add_requested_family(var v4, 3))
+    test.assert(not turnattr.add_additional_family(var v4, 3))
+    test.assert_eq(v4.len(), 28)
+
+@test
+fn test_the_address_error_code_follows_figure_10() [io]
+    var m = fresh()
+    test.assert(turnattr.add_address_error(var m, stunwire.STUN_FAMILY_IPV6, 508, "Insufficient Capacity"))
+    test.assert_eq(bytes_from(var m, 20),
+        "128 1 0 25 2 0 5 8 73 110 115 117 102 102 105 99 105 101 110 116 32 67 97 112 97 99 105 116 121 0 0 0 ")
+    let h = stunwire.parse(var m)
+    test.assert_eq(h.status, stunwire.STUN_PARSE_OK)
+    let e = turnattr.read_address_error(var m, h)
+    test.assert(e.present)
+    test.assert_eq(e.family, 2)
+    test.assert_eq(e.code, 508)
+    test.case("it is not an ERROR-CODE: the message holds none")
+    test.assert_eq(stunwire.count(var m, h, stunwire.STUN_ATTR_ERROR_CODE), 0)
+    test.case("440 for IPv4, an empty reason, and a message without it")
+    var n = fresh()
+    test.assert(turnattr.add_address_error(var n, stunwire.STUN_FAMILY_IPV4, 440, ""))
+    let hn = stunwire.parse(var n)
+    test.assert_eq(turnattr.read_address_error(var n, hn).code, 440)
+    test.assert_eq(turnattr.read_address_error(var n, hn).family, 1)
+    var none = fresh()
+    test.assert(not turnattr.read_address_error(var none, stunwire.parse(var none)).present)
+    test.case("a family that is not IPv4 or IPv6, a code out of range, and a full message")
+    var bad = fresh()
+    test.assert(not turnattr.add_address_error(var bad, 0, 440, "x"))
+    test.assert(not turnattr.add_address_error(var bad, 1, 200, "x"))
+    test.assert(not turnattr.add_address_error(var bad, 1, 700, "x"))
+    test.assert_eq(bad.len(), 20)
+    var full = fresh()
+    for _i in 0..4
+        test.assert(stunwire.add_str(var full, stunwire.STUN_ATTR_SOFTWARE, str.repeat("x", 300)))
+    test.assert(stunwire.add_str(var full, stunwire.STUN_ATTR_SOFTWARE, str.repeat("x", 30)))
+    test.assert(not turnattr.add_address_error(var full, 1, 440, "x"))
+
+@test
+fn test_the_icmp_attribute_follows_figure_11() [io]
+    var m = fresh()
+    test.assert(turnattr.add_icmp(var m, 3, 4, 1400))
+    test.assert_eq(bytes_from(var m, 20), "128 4 0 8 0 0 3 4 0 0 5 120 ")
+    let h = stunwire.parse(var m)
+    let i = turnattr.read_icmp(var m, h)
+    test.assert(i.present)
+    test.assert_eq(i.kind, 3)
+    test.assert_eq(i.code, 4)
+    test.assert_eq(i.data, 1400)
+    test.case("a message without it, and one whose attribute has the wrong length")
+    var none = fresh()
+    test.assert(not turnattr.read_icmp(var none, stunwire.parse(var none)).present)
+    var short = fresh()
+    test.assert(stunwire.add_int(var short, turnattr.TURN_ATTR_ICMP, 5, 4))
+    test.assert(not turnattr.read_icmp(var short, stunwire.parse(var short)).present)
+
+@test
+fn test_the_readers_answer_for_absent_and_malformed_attributes() [io]
+    var m = fresh()
+    let h = stunwire.parse(var m)
+    test.assert_eq(turnattr.read_channel_number(var m, h), -1)
+    test.assert_eq(turnattr.read_even_port(var m, h), -1)
+    test.assert(not turnattr.has_dont_fragment(var m, h))
+    test.assert(not turnattr.read_token(var m, h).present)
+    test.case("present and well formed")
+    test.assert(turnwire.add_channel_number(var m, 0x4ABC))
+    test.assert(turnwire.add_even_port(var m, false))
+    test.assert(turnwire.add_dont_fragment(var m))
+    test.assert(turnwire.add_reservation_token(var m, 0xFFFFFFFFFFFFFFFF))
+    let g = stunwire.parse(var m)
+    test.assert_eq(turnattr.read_channel_number(var m, g), 0x4ABC)
+    test.assert_eq(turnattr.read_even_port(var m, g), 0)
+    test.assert(turnattr.has_dont_fragment(var m, g))
+    let t = turnattr.read_token(var m, g)
+    test.assert(t.present)
+    test.assert_eq(t.value, -1)
+    test.case("an attribute of the wrong length is not read")
+    var bad = fresh()
+    test.assert(stunwire.add_int(var bad, turnwire.TURN_ATTR_CHANNEL_NUMBER, 7, 2))
+    test.assert(stunwire.add_int(var bad, turnwire.TURN_ATTR_EVEN_PORT, 7, 2))
+    test.assert(stunwire.add_int(var bad, turnwire.TURN_ATTR_RESERVATION_TOKEN, 7, 4))
+    test.assert(stunwire.add_int(var bad, turnwire.TURN_ATTR_REQUESTED_ADDRESS_FAMILY, 7, 2))
+    test.assert(stunwire.add_int(var bad, turnattr.TURN_ATTR_ADDITIONAL_ADDRESS_FAMILY, 7, 2))
+    test.assert(stunwire.add_int(var bad, turnattr.TURN_ATTR_ADDRESS_ERROR_CODE, 7, 2))
+    let hb = stunwire.parse(var bad)
+    test.assert_eq(turnattr.read_channel_number(var bad, hb), -1)
+    test.assert_eq(turnattr.read_even_port(var bad, hb), -1)
+    test.assert(not turnattr.read_token(var bad, hb).present)
+    test.assert_eq(turnattr.read_requested_family(var bad, hb), 0)
+    test.assert_eq(turnattr.read_additional_family(var bad, hb), 0)
+    test.assert(not turnattr.read_address_error(var bad, hb).present)
+
+@test
+fn test_the_nth_address_counts_attributes_of_a_type() [io]
+    var m = fresh()
+    let a = stunwire.addr_v4(198, 51, 100, 7, 49152)
+    let b = stunwire.addr_v6(0x20010DB8, 0x7, 49153)
+    test.assert(stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, a, id(), true))
+    test.assert(stunwire.add_str(var m, stunwire.STUN_ATTR_SOFTWARE, "x"))
+    test.assert(stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, b, id(), true))
+    let h = stunwire.parse(var m)
+    test.assert(stunwire.addr_eq(turnattr.nth_address(var m, h, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, 0), a))
+    test.assert(stunwire.addr_eq(turnattr.nth_address(var m, h, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, 1), b))
+    test.assert_eq(turnattr.nth_address(var m, h, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, 2).family, 0)
+    test.assert_eq(turnattr.nth_address(var m, h, turnwire.TURN_ATTR_XOR_PEER_ADDRESS, 0).family, 0)
+
+@test
+fn test_the_error_codes_and_attribute_numbers_are_the_rfc_values() [io]
+    test.assert_eq(turnattr.TURN_E_ADDRESS_FAMILY, 440)
+    test.assert_eq(turnattr.TURN_E_PEER_FAMILY_MISMATCH, 443)
+    test.assert_eq(turnattr.TURN_ATTR_ADDITIONAL_ADDRESS_FAMILY, 0x8000)
+    test.assert_eq(turnattr.TURN_ATTR_ADDRESS_ERROR_CODE, 0x8001)
+    test.assert_eq(turnattr.TURN_ATTR_ICMP, 0x8004)

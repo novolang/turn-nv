@@ -1,0 +1,142 @@
+// turnframe_tests.nv — ChannelData and STUN messages on a stream, RFC 8656
+// section 12.4 to 12.6.
+//
+// THE FRAMES ARE DERIVED FROM THE FIGURE OF SECTION 12.4, a two-byte channel
+// number, a two-byte length of the application data, the data, and over a
+// stream padding with zeros to a multiple of four that the length does not
+// count.  So the channel 0x4001 carrying 01 02 03 is
+//
+//   40 01 00 03 01 02 03          over UDP (7 bytes, the padding is optional)
+//   40 01 00 03 01 02 03 00       over a stream (8 bytes)
+//
+// and the channel 0x4FFF carrying nothing is 4F FF 00 00, which needs no
+// padding.  A STUN message on the same stream is its 20-byte header and the
+// length the header holds, which is already a multiple of four.  The first
+// byte tells them apart: 0 through 3 for STUN, 0x40 through 0x4F for
+// ChannelData (Table 3).
+
+use std.str
+use std.test
+use stunwire
+use turnwire
+use turnframe
+
+// Feed bytes to a reader and answer the last status.
+fn feed(var d: turnframe.TurnDeframer, bytes: [Int]) -> Int
+    var last = 0
+    for b in bytes
+        last = turnframe.push(var d, b)
+    last
+
+fn dump(var m: stunwire.StunMsg) -> Str
+    var s = ""
+    for i in 0..m.len()
+        s = s + str.from_int(m[i] as Int) + " "
+    s
+
+@test
+fn test_a_channel_data_message_over_a_stream_is_padded_and_cut_out() [io]
+    var d = turnframe.deframer()
+    var out: stunwire.StunMsg = Vec.new()
+    test.case("the first byte, the header, then the data: more is needed until the last data byte")
+    test.assert_eq(feed(var d, [0x40, 0x01, 0x00]), turnframe.TURN_FRAME_MORE)
+    test.assert_eq(feed(var d, [0x03, 0x01, 0x02]), turnframe.TURN_FRAME_MORE)
+    test.assert(not turnframe.take(var d, var out))
+    test.assert_eq(turnframe.push(var d, 0x03), turnframe.TURN_FRAME_READY)
+    test.case("the frame is taken without its padding")
+    test.assert(turnframe.take(var d, var out))
+    test.assert_eq(dump(var out), "64 1 0 3 1 2 3 ")
+    test.case("the padding byte that follows is skipped and the next frame starts after it")
+    test.assert_eq(turnframe.push(var d, 0x00), turnframe.TURN_FRAME_MORE)
+    test.assert_eq(feed(var d, [0x4F, 0xFF, 0x00, 0x00]), turnframe.TURN_FRAME_READY)
+    test.assert(turnframe.take(var d, var out))
+    test.assert_eq(dump(var out), "79 255 0 0 ")
+    test.assert(not turnframe.take(var d, var out))
+
+@test
+fn test_a_stun_message_on_a_stream_is_its_header_and_its_length() [io]
+    var m: stunwire.StunMsg = Vec.new()
+    let id = stunwire.txid(1, 2)
+    test.assert(stunwire.begin(var m, stunwire.STUN_REQUEST, turnwire.TURN_ALLOCATE, id))
+    test.assert(turnwire.add_requested_transport(var m, turnwire.TURN_TRANSPORT_UDP))
+    var d = turnframe.deframer()
+    var out: stunwire.StunMsg = Vec.new()
+    var last = 0
+    for i in 0..m.len()
+        last = turnframe.push(var d, m[i] as Int)
+        if i < m.len() - 1
+            test.assert_eq(last, turnframe.TURN_FRAME_MORE)
+    test.assert_eq(last, turnframe.TURN_FRAME_READY)
+    test.assert(turnframe.take(var d, var out))
+    test.assert_eq(dump(var out), dump(var m))
+    test.assert_eq(stunwire.parse(var out).status, stunwire.STUN_PARSE_OK)
+    test.case("a ChannelData message and a STUN message back to back")
+    var cd: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    for b in [1, 2, 3, 4, 5]
+        let _ = data.push(b as u8)
+    test.assert(turnwire.channel_data(var cd, 0x4001, var data, 0, 5, true))
+    test.assert_eq(cd.len(), 12)
+    var count = 0
+    for i in 0..cd.len()
+        if turnframe.push(var d, cd[i] as Int) == turnframe.TURN_FRAME_READY
+            count = count + 1
+    for i in 0..m.len()
+        if turnframe.push(var d, m[i] as Int) == turnframe.TURN_FRAME_READY
+            count = count + 1
+    test.assert_eq(count, 2)
+    test.assert(turnframe.take(var d, var out))
+    test.assert_eq(dump(var out), dump(var m))
+
+@test
+fn test_a_byte_that_starts_no_message_loses_the_stream() [io]
+    for first in [0x04, 0x20, 0x50, 0x80, 0xFF]
+        var d = turnframe.deframer()
+        test.assert_eq(feed(var d, [first, 0, 0, 0]), turnframe.TURN_FRAME_NOT_TURN)
+    test.case("a message longer than a StunMsg holds")
+    var big = turnframe.deframer()
+    test.assert_eq(feed(var big, [0x40, 0x01, 0x05, 0x00]), turnframe.TURN_FRAME_TOO_BIG)
+    var stun = turnframe.deframer()
+    test.assert_eq(feed(var stun, [0x00, 0x01, 0x05, 0x00]), turnframe.TURN_FRAME_TOO_BIG)
+    test.case("the longest message is 1280 bytes, a ChannelData message of 1276 bytes of data")
+    var edge = turnframe.deframer()
+    test.assert_eq(feed(var edge, [0x40, 0x02, 0x04, 0xFC]), turnframe.TURN_FRAME_MORE)
+    test.assert_eq(edge.need, 1280)
+
+@test
+fn test_a_byte_pushed_before_the_message_is_taken_starts_the_next() [io]
+    var d = turnframe.deframer()
+    test.assert_eq(feed(var d, [0x40, 0x01, 0x00, 0x00]), turnframe.TURN_FRAME_READY)
+    test.assert(d.ready)
+    test.assert_eq(feed(var d, [0x40, 0x02, 0x00, 0x01, 0x09]), turnframe.TURN_FRAME_READY)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert(turnframe.take(var d, var out))
+    test.assert_eq(dump(var out), "64 2 0 1 9 ")
+
+@test
+fn test_pad_for_stream_pads_channel_data_and_leaves_stun_alone() [io]
+    var data: stunwire.StunMsg = Vec.new()
+    for b in [1, 2, 3]
+        let _ = data.push(b as u8)
+    var cd: stunwire.StunMsg = Vec.new()
+    test.assert(turnwire.channel_data(var cd, 0x4001, var data, 0, 3, false))
+    test.assert_eq(cd.len(), 7)
+    turnframe.pad_for_stream(var cd)
+    test.assert_eq(dump(var cd), "64 1 0 3 1 2 3 0 ")
+    turnframe.pad_for_stream(var cd)
+    test.assert_eq(cd.len(), 8)
+    var m: stunwire.StunMsg = Vec.new()
+    test.assert(stunwire.begin(var m, stunwire.STUN_REQUEST, turnwire.TURN_ALLOCATE, stunwire.txid(1, 2)))
+    turnframe.pad_for_stream(var m)
+    test.assert_eq(m.len(), 20)
+    var empty: stunwire.StunMsg = Vec.new()
+    turnframe.pad_for_stream(var empty)
+    test.assert_eq(empty.len(), 0)
+    test.case("4 + 5 = 9 bytes take three bytes of padding to reach 12")
+    var five: stunwire.StunMsg = Vec.new()
+    for b in [1, 2, 3, 4, 5]
+        let _ = five.push(b as u8)
+    var cd5: stunwire.StunMsg = Vec.new()
+    test.assert(turnwire.channel_data(var cd5, 0x4002, var five, 0, 5, false))
+    turnframe.pad_for_stream(var cd5)
+    test.assert_eq(cd5.len(), 12)

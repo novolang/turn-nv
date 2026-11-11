@@ -1,0 +1,182 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A CONNECTED DEVICE that cannot reach its peer directly: a
+// Cortex-M that allocates a relay on a TURN server, signs its requests with
+// the long-term credentials, installs a permission and a channel for a peer,
+// and sends and receives its media as ChannelData, all with no heap.
+// Everything it decides is here and is compiled for the hardware rather than
+// claimed.  The datagram socket is the caller's, so the probe passes the
+// messages between the two ends in memory, with the server's part written
+// below.
+//
+// What it checks, with the number of checks each adds:
+//
+//   - the attributes of RFC 8656 section 18 built and read back (4)
+//   - a stream of two padded ChannelData messages cut out of bytes (4)
+//   - an allocation through the 401 challenge to a relayed address (3)
+//   - a permission, a channel binding, and data sent and received in
+//     ChannelData (6)
+//   - the allocation refreshed at half its lifetime and released (3)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.
+
+use std.str
+use stunwire
+use stunmac
+use turnwire
+use turnattr
+use turnframe
+use turnsess
+
+@tier(embedded)
+@no_alloc
+fn txid(n: Int) -> stunwire.StunTxid []
+    stunwire.txid(0x1000 + n, 0x20000000 + n)
+
+// The server's reply to the request in `req`: an error `code` if it is not
+// 0, else a success with the relayed address when the request was an
+// Allocate, signed with the key of "alice:example.org:secret" when `sign`.
+@tier(embedded)
+@no_alloc
+fn reply(var req: stunwire.StunMsg, code: Int, sign: Bool) -> stunwire.StunMsg []
+    let h = stunwire.parse(var req)
+    var m: stunwire.StunMsg = Vec.new()
+    if code != 0
+        let _ = stunwire.begin(var m, stunwire.STUN_ERROR, h.method, h.txid)
+        let _ = stunwire.add_error_code(var m, code, "Unauthenticated")
+        let _ = stunwire.add_str(var m, stunwire.STUN_ATTR_REALM, "example.org")
+        let _ = stunwire.add_str(var m, stunwire.STUN_ATTR_NONCE, "n1")
+        return m
+    let _ = stunwire.begin(var m, stunwire.STUN_SUCCESS, h.method, h.txid)
+    if h.method == turnwire.TURN_ALLOCATE
+        let relayed = stunwire.addr_v4(198, 51, 100, 7, 49152)
+        let _ = stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, relayed, h.txid, true)
+    if h.method == turnwire.TURN_ALLOCATE or h.method == turnwire.TURN_REFRESH
+        let _ = turnwire.add_lifetime(var m, 600)
+    if sign
+        var key: stunmac.StunKey = Vec.new()
+        let _ = stunmac.long_term_key(stunmac.STUN_HASH_MD5, "alice", "example.org", "secret", var key)
+        let _ = stunmac.add_integrity(var m, var key, false)
+    m
+
+// The attributes: four checks.
+@tier(embedded)
+@no_alloc
+fn attr_score() -> Int []
+    var n = 0
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_REQUEST, turnwire.TURN_ALLOCATE, txid(1))
+    let _ = turnattr.add_requested_family(var m, 2)
+    let _ = turnattr.add_address_error(var m, 2, 508, "Insufficient Capacity")
+    let _ = turnattr.add_icmp(var m, 3, 4, 1400)
+    let _ = turnwire.add_reservation_token(var m, 0x0102030405060708)
+    let h = stunwire.parse(var m)
+    if turnattr.read_requested_family(var m, h) == 2
+        n = n + 1
+    let e = turnattr.read_address_error(var m, h)
+    if e.present and e.family == 2 and e.code == 508
+        n = n + 1
+    let i = turnattr.read_icmp(var m, h)
+    if i.present and i.kind == 3 and i.code == 4 and i.data == 1400
+        n = n + 1
+    let t = turnattr.read_token(var m, h)
+    if t.present and t.value == 0x0102030405060708
+        n = n + 1
+    n
+
+// Two ChannelData messages on a stream: four checks.
+@tier(embedded)
+@no_alloc
+fn frame_score() -> Int []
+    var n = 0
+    var d = turnframe.deframer()
+    var data: stunwire.StunMsg = Vec.new()
+    for i in 0..5
+        let _ = data.push((i + 1) as u8)
+    var cd: stunwire.StunMsg = Vec.new()
+    let _ = turnwire.channel_data(var cd, 0x4001, var data, 0, 5, true)
+    var out: stunwire.StunMsg = Vec.new()
+    var frames = 0
+    for round in 0..2
+        for i in 0..cd.len()
+            if turnframe.push(var d, cd[i] as Int) == turnframe.TURN_FRAME_READY
+                frames = frames + 1
+                if turnframe.take(var d, var out) and out.len() == 9 and out[8] == 5
+                    n = n + 1
+    if frames == 2
+        n = n + 1
+    if cd.len() == 12 and cd[11] == 0
+        n = n + 1
+    n
+
+// An allocation, a permission, a channel, data and the release: twelve checks.
+@tier(embedded)
+@no_alloc
+fn session_score() -> Int []
+    var n = 0
+    var s = turnsess.session("alice", "secret", 0, false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    if turnsess.allocate(var s, var out, txid(1)) == turnsess.TURN_OK and out.len() == 28
+        n = n + 1
+    var r1 = reply(var out, 401, false)
+    if turnsess.on_datagram(var s, var r1, var out, var data, txid(2)).event == turnsess.TURN_EV_SEND
+        n = n + 1
+    var r2 = reply(var out, 0, true)
+    if turnsess.on_datagram(var s, var r2, var out, var data, txid(3)).event == turnsess.TURN_EV_ALLOCATED
+        n = n + 1
+    let peer = stunwire.addr_v4(192, 0, 2, 1, 5000)
+    if turnsess.permit(var s, var out, peer, txid(4)) == turnsess.TURN_OK
+        n = n + 1
+    var r3 = reply(var out, 0, true)
+    if turnsess.on_datagram(var s, var r3, var out, var data, txid(5)).event == turnsess.TURN_EV_PERMISSION
+        n = n + 1
+    if turnsess.bind_channel(var s, var out, turnsess.free_channel(var s), peer, txid(6)) == turnsess.TURN_OK
+        n = n + 1
+    var r4 = reply(var out, 0, true)
+    let bound = turnsess.on_datagram(var s, var r4, var out, var data, txid(7))
+    if bound.event == turnsess.TURN_EV_BOUND and bound.code == 0x4000
+        n = n + 1
+    var src: stunwire.StunMsg = Vec.new()
+    for i in 0..3
+        let _ = src.push((i + 7) as u8)
+    var wire: stunwire.StunMsg = Vec.new()
+    if turnsess.send_data(var s, var wire, peer, var src, 0, 3, txid(8)) == turnsess.TURN_SENT_CHANNEL and wire.len() == 7
+        n = n + 1
+    var inbound: stunwire.StunMsg = Vec.new()
+    let _ = turnwire.channel_data(var inbound, 0x4000, var src, 0, 3, false)
+    let got = turnsess.on_datagram(var s, var inbound, var out, var data, txid(9))
+    if got.event == turnsess.TURN_EV_DATA and got.n == 3 and data[2] == 9
+        n = n + 1
+    if turnsess.tick(var s, 250000, var out, txid(10)).event == turnsess.TURN_EV_SEND
+        n = n + 1
+    if turnsess.release(var s, var out, txid(11)) == turnsess.TURN_OK
+        n = n + 1
+    var r5 = reply(var out, 0, true)
+    if turnsess.on_datagram(var s, var r5, var out, var data, txid(12)).event == turnsess.TURN_EV_CLOSED
+        n = n + 1
+    n
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    attr_score() + frame_score() + session_score()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 20 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 20
+        hal.uart.write("PASS: turn-embedded\n")
+    else
+        hal.uart.write("FAIL: turn-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

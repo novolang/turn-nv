@@ -1,0 +1,143 @@
+// turnframe.nv — cutting a TURN byte stream into messages, for TURN over TCP
+// and over TLS (RFC 8656 sections 12.5 and 12.6).
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, and no allocation.
+// Over UDP every datagram is one message.  Over a stream the messages follow
+// each other, and the reader finds where one ends from its first four bytes:
+//
+//   - a STUN message, whose first byte is 0 through 3, is the 20-byte header
+//     and the length the header holds.
+//   - a ChannelData message, whose first byte is 64 through 79 (0x40 to 0x4F),
+//     is four bytes and the length in its second two bytes, and over a stream
+//     it is padded with zeros to a multiple of four.  The padding is not in
+//     the length.  The next message starts after it.
+//
+// A first byte that is neither is not TURN: RFC 8656 section 12.5 reserves
+// the other values for the protocols it shares a port with, and on a stream
+// a byte that is not the start of a message means the reader has lost its
+// place, so the connection is no use.  A message longer than the 1280 bytes of
+// `StunMsg` cannot be held, and also loses the place.
+//
+// The reader takes one byte at a time, which is what a UART or a socket
+// callback hands over; a caller with a block of bytes calls `push` for each.
+
+use stunwire
+use turnwire
+
+// More bytes are needed.
+pub const TURN_FRAME_MORE = 0
+// A whole message is in the reader's buffer: take it with `take`.
+pub const TURN_FRAME_READY = 1
+// The first byte was not the start of a STUN or ChannelData message.
+pub const TURN_FRAME_NOT_TURN = 2
+// The message is longer than a `StunMsg` can hold.
+pub const TURN_FRAME_TOO_BIG = 3
+
+// The state of a stream reader.
+pub @value
+struct TurnDeframer
+    // The bytes of the message being read.
+    buf: stunwire.StunMsg
+    // The length the message will have, or -1 until its first four bytes are in.
+    need: Int
+    // Padding bytes still to be skipped after a ChannelData message.
+    skip: Int
+    // Whether `buf` holds a whole message that has not been taken.
+    ready: Bool
+
+// A reader with nothing read.
+//
+// ```novo
+// use turnframe
+//
+// fn main() [io]
+//     let d = turnframe.deframer()
+//     println("${d.need} ${d.ready}")   // -1 false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn deframer() -> TurnDeframer []
+    TurnDeframer { buf: Vec.new(), need: -1, skip: 0, ready: false }
+
+// The length of a message from its first four bytes, or a negative status:
+// -2 for a first byte that is not TURN.
+@tier(embedded)
+@no_alloc
+fn length_of(var d: TurnDeframer) -> Int []
+    let n = (d.buf[2] as Int << 8) | d.buf[3] as Int
+    let first = d.buf[0] as Int
+    if first <= 3
+        return stunwire.STUN_HEADER_LEN + n
+    if first >= 0x40 and first <= 0x4F
+        return 4 + n
+    -2
+
+// Feed one byte of the stream.
+//
+// Answers `TURN_FRAME_MORE`, `TURN_FRAME_READY` when this byte completed a
+// message, or `TURN_FRAME_NOT_TURN` or `TURN_FRAME_TOO_BIG`, after which the
+// stream cannot be read further.  Padding after a ChannelData message is
+// skipped by the calls that follow its end.  A byte fed while a completed
+// message has not been taken starts the next message and the old one is lost;
+// the padding is skipped first.
+//
+// ```novo
+// use turnframe
+//
+// fn main() [io]
+//     var d = turnframe.deframer()
+//     var last = 0
+//     for b in [0x40, 0x01, 0x00, 0x03, 0xAA, 0xBB, 0xCC, 0x00]
+//         last = turnframe.push(var d, b)
+//     println("${last} ${d.ready} ${d.buf.len()}")   // 0 true 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn push(var d: TurnDeframer, b: Int) -> Int []
+    if d.skip > 0
+        d.skip = d.skip - 1
+        return TURN_FRAME_MORE
+    if d.ready
+        d.buf.clear()
+        d.need = -1
+        d.ready = false
+    let _ = d.buf.push((b & 0xFF) as u8)
+    if d.buf.len() == 4
+        d.need = length_of(var d)
+        if d.need == -2
+            return TURN_FRAME_NOT_TURN
+        if d.need > stunwire.STUN_MSG_MAX
+            return TURN_FRAME_TOO_BIG
+    if d.need >= 0 and d.buf.len() == d.need
+        d.ready = true
+        if (d.buf[0] as Int >> 6) == 1
+            d.skip = stunwire.pad4(d.need) - d.need
+        return TURN_FRAME_READY
+    TURN_FRAME_MORE
+
+// Move the message that `push` completed into `out`, replacing what it held,
+// and make the reader ready for the next one.  Answers false, changing
+// nothing, when no message is complete.
+pub @tier(embedded)
+@no_alloc
+fn take(var d: TurnDeframer, var out: stunwire.StunMsg) -> Bool []
+    if not d.ready
+        return false
+    out.clear()
+    for i in 0..d.buf.len()
+        let _ = out.push(d.buf[i])
+    d.buf.clear()
+    d.need = -1
+    d.ready = false
+    true
+
+// Append the zero bytes that make a ChannelData message a multiple of four
+// bytes long.  A STUN message, which already is one, and an empty buffer are
+// left alone.
+pub @tier(embedded)
+@no_alloc
+fn pad_for_stream(var m: stunwire.StunMsg) []
+    if turnwire.is_channel_data(var m)
+        for _i in 0..3
+            if m.len() % 4 != 0
+                stunwire.put(var m, 0)

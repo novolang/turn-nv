@@ -1,0 +1,221 @@
+// turnattr.nv — the TURN attributes of RFC 8656 section 18 that stun-nv's
+// `turnwire` does not build or read, and readers for those it only builds.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, and no allocation.
+// `turnwire` of stun-nv has the numbers of the methods and of the attributes
+// and builders for REQUESTED-TRANSPORT, LIFETIME, CHANNEL-NUMBER, EVEN-PORT,
+// DONT-FRAGMENT, RESERVATION-TOKEN, XOR-PEER-ADDRESS and DATA.  RFC 8656 adds
+// three attributes to RFC 5766, all comprehension-optional (0x8000 and over):
+//
+//   ADDITIONAL-ADDRESS-FAMILY  0x8000  the second address family a client
+//                                      asks for in an Allocate request
+//   ADDRESS-ERROR-CODE         0x8001  why the server did not allocate one
+//                                      of the families asked for
+//   ICMP                       0x8004  why a UDP datagram to a peer was dropped
+//
+// and the error codes 440 (Address Family not Supported) and 443 (Peer
+// Address Family Mismatch).  REQUESTED-ADDRESS-FAMILY, 0x0017, is in
+// `turnwire` as a number; its builder is here.
+//
+// A reader answers a struct with a `present` field, because the value of a
+// RESERVATION-TOKEN uses all 64 bits and so has no spare number to mean
+// "absent".
+
+use stunwire
+use turnwire
+
+// Attribute: ADDITIONAL-ADDRESS-FAMILY, 0x8000.
+pub const TURN_ATTR_ADDITIONAL_ADDRESS_FAMILY = 0x8000
+// Attribute: ADDRESS-ERROR-CODE, 0x8001.
+pub const TURN_ATTR_ADDRESS_ERROR_CODE = 0x8001
+// Attribute: ICMP, 0x8004.
+pub const TURN_ATTR_ICMP = 0x8004
+
+// Error code 440, Address Family not Supported.
+pub const TURN_E_ADDRESS_FAMILY = 440
+// Error code 443, Peer Address Family Mismatch.
+pub const TURN_E_PEER_FAMILY_MISMATCH = 443
+
+// A RESERVATION-TOKEN read from a message.
+pub @value
+struct TurnToken
+    // Whether the attribute was there and had eight bytes.
+    present: Bool
+    // The token, all 64 bits.
+    value: Int
+
+// An ADDRESS-ERROR-CODE read from a message.
+pub @value
+struct TurnAddrError
+    // Whether the attribute was there and well formed.
+    present: Bool
+    // The family the server did not allocate: 1 for IPv4, 2 for IPv6.
+    family: Int
+    // The error code, 440 or 508 as RFC 8656 section 18.12 says.
+    code: Int
+
+// An ICMP attribute read from a message.
+pub @value
+struct TurnIcmp
+    // Whether the attribute was there and had eight bytes.
+    present: Bool
+    // The ICMP type.
+    kind: Int
+    // The ICMP code.
+    code: Int
+    // The error data: the next-hop MTU for a fragmentation-needed message,
+    // else 0.
+    data: Int
+
+// Append a REQUESTED-ADDRESS-FAMILY attribute: the family and three
+// reserved bytes (RFC 8656 section 18.6).  `family` is 1 or 2; any other
+// answers false.
+//
+// ```novo
+// use stunwire
+// use turnattr
+//
+// fn main() [io]
+//     var m: stunwire.StunMsg = Vec.new()
+//     let id = stunwire.txid(1, 2)
+//     let _ = stunwire.begin(var m, stunwire.STUN_REQUEST, 3, id)
+//     let ok = turnattr.add_requested_family(var m, stunwire.STUN_FAMILY_IPV6)
+//     println("${ok} ${m.len()} ${m[24]}")   // true 28 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_requested_family(var m: stunwire.StunMsg, family: Int) -> Bool []
+    if family != stunwire.STUN_FAMILY_IPV4 and family != stunwire.STUN_FAMILY_IPV6
+        return false
+    stunwire.add_int(var m, turnwire.TURN_ATTR_REQUESTED_ADDRESS_FAMILY, family << 24, 4)
+
+// Append an ADDITIONAL-ADDRESS-FAMILY attribute.  RFC 8656 section 18.11
+// allows the value 2 (IPv6) only; any other family answers false.
+pub @tier(embedded)
+@no_alloc
+fn add_additional_family(var m: stunwire.StunMsg, family: Int) -> Bool []
+    if family != stunwire.STUN_FAMILY_IPV6
+        return false
+    stunwire.add_int(var m, TURN_ATTR_ADDITIONAL_ADDRESS_FAMILY, family << 24, 4)
+
+// Append an ADDRESS-ERROR-CODE attribute: the family, the class and number
+// of `code` and a reason phrase cut at 127 bytes.  `code` is 300 through
+// 699 and `family` 1 or 2; otherwise false.
+pub @tier(embedded)
+@no_alloc
+fn add_address_error(var m: stunwire.StunMsg, family: Int, code: Int, reason: Str) -> Bool []
+    if family != stunwire.STUN_FAMILY_IPV4 and family != stunwire.STUN_FAMILY_IPV6
+        return false
+    // The value is that of ERROR-CODE with the family in the first of its two
+    // reserved bytes, so the attribute is written as an ERROR-CODE and then
+    // given its own type and family.
+    let at = m.len()
+    if not stunwire.add_error_code(var m, code, reason)
+        return false
+    m[at] = (TURN_ATTR_ADDRESS_ERROR_CODE >> 8) as u8
+    m[at + 1] = (TURN_ATTR_ADDRESS_ERROR_CODE & 0xFF) as u8
+    m[at + 4] = family as u8
+    true
+
+// Append an ICMP attribute: two reserved bytes, the type, the code and four
+// bytes of error data.
+pub @tier(embedded)
+@no_alloc
+fn add_icmp(var m: stunwire.StunMsg, kind: Int, code: Int, data: Int) -> Bool []
+    stunwire.add_int(var m, TURN_ATTR_ICMP, ((kind & 0xFF) << 40) | ((code & 0xFF) << 32) | (data & 0xFFFFFFFF), 8)
+
+// The channel number a CHANNEL-NUMBER attribute holds, or -1 when there is
+// none or it is not four bytes.
+pub @tier(embedded)
+@no_alloc
+fn read_channel_number(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> Int []
+    let a = stunwire.find(var m, h, turnwire.TURN_ATTR_CHANNEL_NUMBER)
+    if not stunwire.present(a) or a.len != 4
+        return -1
+    (m[a.off] as Int << 8) | m[a.off + 1] as Int
+
+// The family a REQUESTED-ADDRESS-FAMILY attribute holds, or 0 when there is
+// none.
+pub @tier(embedded)
+@no_alloc
+fn read_requested_family(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> Int []
+    let a = stunwire.find(var m, h, turnwire.TURN_ATTR_REQUESTED_ADDRESS_FAMILY)
+    if not stunwire.present(a) or a.len != 4
+        return 0
+    m[a.off] as Int
+
+// The family an ADDITIONAL-ADDRESS-FAMILY attribute holds, or 0 when there
+// is none.
+pub @tier(embedded)
+@no_alloc
+fn read_additional_family(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> Int []
+    let a = stunwire.find(var m, h, TURN_ATTR_ADDITIONAL_ADDRESS_FAMILY)
+    if not stunwire.present(a) or a.len != 4
+        return 0
+    m[a.off] as Int
+
+// The EVEN-PORT attribute of a message: -1 when there is none, 0 when it
+// asks for an even port and 1 when it also asks the server to reserve the
+// next higher one.
+pub @tier(embedded)
+@no_alloc
+fn read_even_port(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> Int []
+    let a = stunwire.find(var m, h, turnwire.TURN_ATTR_EVEN_PORT)
+    if not stunwire.present(a) or a.len != 1
+        return -1
+    m[a.off] as Int >> 7
+
+// Whether a message carries DONT-FRAGMENT.
+pub @tier(embedded)
+@no_alloc
+fn has_dont_fragment(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> Bool []
+    stunwire.present(stunwire.find(var m, h, turnwire.TURN_ATTR_DONT_FRAGMENT))
+
+// The RESERVATION-TOKEN of a message.
+pub @tier(embedded)
+@no_alloc
+fn read_token(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> TurnToken []
+    let a = stunwire.find(var m, h, turnwire.TURN_ATTR_RESERVATION_TOKEN)
+    if not stunwire.present(a) or a.len != 8
+        return TurnToken { present: false, value: 0 }
+    var v = 0
+    for i in 0..8
+        v = (v << 8) | m[a.off + i] as Int
+    TurnToken { present: true, value: v }
+
+// The ADDRESS-ERROR-CODE of a message.
+pub @tier(embedded)
+@no_alloc
+fn read_address_error(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> TurnAddrError []
+    let a = stunwire.find(var m, h, TURN_ATTR_ADDRESS_ERROR_CODE)
+    if not stunwire.present(a) or a.len < 4
+        return TurnAddrError { present: false, family: 0, code: 0 }
+    TurnAddrError { present: true, family: m[a.off] as Int,
+                    code: (m[a.off + 2] as Int & 7) * 100 + m[a.off + 3] as Int }
+
+// The ICMP attribute of a message.
+pub @tier(embedded)
+@no_alloc
+fn read_icmp(var m: stunwire.StunMsg, h: stunwire.StunHeader) -> TurnIcmp []
+    let a = stunwire.find(var m, h, TURN_ATTR_ICMP)
+    if not stunwire.present(a) or a.len != 8
+        return TurnIcmp { present: false, kind: 0, code: 0, data: 0 }
+    TurnIcmp { present: true, kind: m[a.off + 2] as Int, code: m[a.off + 3] as Int,
+               data: (m[a.off + 4] as Int << 24) | (m[a.off + 5] as Int << 16)
+                   | (m[a.off + 6] as Int << 8) | m[a.off + 7] as Int }
+
+// The `n`th address, counting from 0, of the attributes of a type: a second
+// XOR-RELAYED-ADDRESS when a client asked for both families.  The family of
+// the answer is 0 when there is no such attribute.
+pub @tier(embedded)
+@no_alloc
+fn nth_address(var m: stunwire.StunMsg, h: stunwire.StunHeader, kind: Int,
+               n: Int) -> stunwire.StunAddr []
+    var it = stunwire.iter(h)
+    var seen = 0
+    for _i in 0..h.total
+        if stunwire.next(var m, var it) and it.cur.kind == kind
+            if seen == n
+                return stunwire.read_addr(var m, it.cur, h.txid, true)
+            seen = seen + 1
+    stunwire.StunAddr { family: 0, port: 0, hi: 0, lo: 0 }

@@ -1,0 +1,1140 @@
+// turnsess_tests.nv — the session, from the first Allocate to the release,
+// against a server written in the test.
+//
+// THE EXCHANGES ARE THE ONES OF RFC 8656 sections 6 to 12 and RFC 8489
+// section 9.2.  The first Allocate carries REQUESTED-TRANSPORT and nothing
+// else; the server answers 401 with a realm and a nonce; the second carries
+// USERNAME, REALM, NONCE and MESSAGE-INTEGRITY under the MD5 key of
+// "alice:example.org:secret"; the server answers with the relayed address,
+// the mapped address and a lifetime, signed with the same key.  The test
+// computes that key itself with `stunmac` and verifies the session's
+// requests with `check_integrity`, so the check is of the session's output
+// and not of its own bookkeeping.
+//
+// THE LIFETIMES are the RFC's: an allocation of 600 seconds (section 7.2), a
+// permission of 300 (section 9) and a channel binding of 600 (section 12),
+// and the quarantine of 5 minutes after a binding expires (section 12).  The
+// tests move the clock with `tick` and read the events.
+
+use std.str
+use std.test
+use stunwire
+use stunmac
+use turnwire
+use turnattr
+use turnsess
+
+fn id(n: Int) -> stunwire.StunTxid
+    stunwire.txid(0x1000 + n, 0x20000000 + n)
+
+fn relayed() -> stunwire.StunAddr
+    stunwire.addr_v4(198, 51, 100, 7, 49152)
+
+fn relayed6() -> stunwire.StunAddr
+    stunwire.addr_v6(0x20010DB8000000AA, 0x0000000000000007, 49153)
+
+fn mapped() -> stunwire.StunAddr
+    stunwire.addr_v4(203, 0, 113, 9, 40000)
+
+fn peer(n: Int) -> stunwire.StunAddr
+    stunwire.addr_v4(192, 0, 2, n, 5000 + n)
+
+fn server_key() -> stunmac.StunKey
+    var k: stunmac.StunKey = Vec.new()
+    let _ = stunmac.long_term_key(stunmac.STUN_HASH_MD5, "alice", "example.org", "secret", var k)
+    k
+
+// A response to the request in `req`: the same method and transaction ID,
+// the attributes the method's success carries, and an integrity under the
+// server key if `sign`.
+fn ok_reply(var req: stunwire.StunMsg, life: Int, sign: Bool) -> stunwire.StunMsg
+    let h = stunwire.parse(var req)
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_SUCCESS, h.method, h.txid)
+    if h.method == turnwire.TURN_ALLOCATE
+        let _ = stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, relayed(), h.txid, true)
+        let _ = stunwire.add_addr(var m, stunwire.STUN_ATTR_XOR_MAPPED_ADDRESS, mapped(), h.txid, true)
+    if h.method == turnwire.TURN_ALLOCATE or h.method == turnwire.TURN_REFRESH
+        let _ = turnwire.add_lifetime(var m, life)
+    if sign
+        var k = server_key()
+        let _ = stunmac.add_integrity(var m, var k, false)
+    m
+
+// An error response to the request in `req`.
+fn err_reply(var req: stunwire.StunMsg, code: Int, realm: Str, nonce: Str) -> stunwire.StunMsg
+    let h = stunwire.parse(var req)
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_ERROR, h.method, h.txid)
+    let _ = stunwire.add_error_code(var m, code, "x")
+    if str.len(realm) > 0
+        let _ = stunwire.add_str(var m, stunwire.STUN_ATTR_REALM, realm)
+    if str.len(nonce) > 0
+        let _ = stunwire.add_str(var m, stunwire.STUN_ATTR_NONCE, nonce)
+    m
+
+// A session that has been allocated: the Allocate, the 401, the retry and the
+// success, with transaction IDs 1, 2 and 3.
+fn allocated(reliable: Bool) -> turnsess.TurnSession
+    var s = turnsess.session("alice", "secret", 0, reliable)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    let again = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+    test.assert_eq(again.event, turnsess.TURN_EV_SEND)
+    var r2 = ok_reply(var out, 600, true)
+    let done = turnsess.on_datagram(var s, var r2, var out, var data, id(3))
+    test.assert_eq(done.event, turnsess.TURN_EV_ALLOCATED)
+    s
+
+// Send a request with the session and let the server confirm it: the request
+// is in `out` after `r`, the success is fed back and its step answered.
+fn confirm(var s: turnsess.TurnSession, var req: stunwire.StunMsg) -> turnsess.TurnStep
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    var rep = ok_reply(var req, 600, true)
+    turnsess.on_datagram(var s, var rep, var out, var data, id(99))
+
+fn step_event(var s: turnsess.TurnSession, ms: Int) -> Int
+    var out: stunwire.StunMsg = Vec.new()
+    turnsess.tick(var s, ms, var out, id(98)).event
+
+// What happened while the clock ran.
+@value
+struct Tally
+    alloc: Int
+    perm: Int
+    bind: Int
+    expired: Int
+    expired_channel: Int
+    failed: Int
+    request_failed: Int
+
+fn bump(var t: Tally, st: turnsess.TurnStep, method: Int)
+    if st.event == turnsess.TURN_EV_SEND
+        if method == turnwire.TURN_REFRESH
+            t.alloc = t.alloc + 1
+        if method == turnwire.TURN_CREATE_PERMISSION
+            t.perm = t.perm + 1
+        if method == turnwire.TURN_CHANNEL_BIND
+            t.bind = t.bind + 1
+    if st.event == turnsess.TURN_EV_EXPIRED
+        t.expired = t.expired + 1
+        if st.code != 0
+            t.expired_channel = t.expired_channel + 1
+    if st.event == turnsess.TURN_EV_FAILED
+        t.failed = t.failed + 1
+    if st.event == turnsess.TURN_EV_REQUEST_FAILED
+        t.request_failed = t.request_failed + 1
+
+fn no_tally() -> Tally
+    Tally { alloc: 0,
+        perm: 0,
+        bind: 0,
+        expired: 0,
+        expired_channel: 0,
+        failed: 0,
+        request_failed: 0 }
+
+// Let `ms` milliseconds pass, then ask until the session has nothing more to
+// do.  A request the session sends is answered by the server when `answer`
+// is true, and lost when it is false.
+fn pump(var s: turnsess.TurnSession, var t: Tally, ms: Int, answer: Bool)
+    var elapsed = ms
+    for k in 0..8
+        var out: stunwire.StunMsg = Vec.new()
+        let st = turnsess.tick(var s, elapsed, var out, id(400 + k))
+        elapsed = 0
+        bump(var t, st, stunwire.parse(var out).method)
+        if st.event == turnsess.TURN_EV_SEND and answer
+            var rep = ok_reply(var out, 3600, true)
+            var data: stunwire.StunMsg = Vec.new()
+            let got = turnsess.on_datagram(var s, var rep, var out, var data, id(500 + k))
+            bump(var t, got, 0)
+
+// Run the clock for `seconds` in steps of 5.
+fn run_for(var s: turnsess.TurnSession, var t: Tally, seconds: Int, answer: Bool)
+    for _k in 0..seconds / 5
+        pump(var s, var t, 5000, answer)
+
+// A session allocated for `life` seconds.
+fn allocated_for(life: Int) -> turnsess.TurnSession
+    var s = turnsess.session("alice", "secret", 0, false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    let _ = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+    var r2 = ok_reply(var out, life, true)
+    let _ = turnsess.on_datagram(var s, var r2, var out, var data, id(3))
+    s
+
+@test
+fn test_the_first_allocate_has_only_the_transport() [io]
+    test.case("a new session is idle")
+    var s = turnsess.session("alice", "secret", 0, false)
+    test.assert_eq(s.state, turnsess.TURN_IDLE)
+    test.case("the request is an Allocate with REQUESTED-TRANSPORT and nothing else")
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.allocate(var s, var out, id(1)), turnsess.TURN_OK)
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATING)
+    let h = stunwire.parse(var out)
+    test.assert_eq(h.class, stunwire.STUN_REQUEST)
+    test.assert_eq(h.method, turnwire.TURN_ALLOCATE)
+    test.assert(stunwire.txid_eq(h.txid, id(1)))
+    test.assert_eq(stunwire.count(var out, h, turnwire.TURN_ATTR_REQUESTED_TRANSPORT), 1)
+    test.assert_eq(out.len(), 28)
+    test.case("a second allocate is refused, and so is everything that needs an allocation")
+    test.assert_eq(turnsess.allocate(var s, var out, id(9)), turnsess.TURN_ERR_STATE)
+    test.assert_eq(turnsess.release(var s, var out, id(9)), turnsess.TURN_ERR_STATE)
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(9)), turnsess.TURN_ERR_STATE)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(9)), turnsess.TURN_ERR_STATE)
+    var src: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.send_data(var s, var out, peer(1), var src, 0, 0, id(9)), turnsess.TURN_ERR_STATE)
+
+@test
+fn test_a_password_that_is_too_long_fails_the_session_at_once() [io]
+    let s = turnsess.session("alice", str.repeat("p", 129), 0, false)
+    test.assert_eq(s.state, turnsess.TURN_FAILED)
+    test.assert_eq(s.last_error, turnsess.TURN_ERR_ARGUMENT)
+    var t = turnsess.session("alice", "secret", 0, false)
+    test.assert(not turnsess.set_options(var t, turnsess.TurnOpts { family: 0,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: -1 }))
+
+@test
+fn test_a_401_is_answered_with_credentials_and_the_long_term_key() [io]
+    var s = turnsess.session("alice", "secret", 0, false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    test.case("a 401 with a realm and a nonce makes the session send the request again")
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    var again: stunwire.StunMsg = Vec.new()
+    let st = turnsess.on_datagram(var s, var r1, var again, var data, id(2))
+    test.assert_eq(st.event, turnsess.TURN_EV_SEND)
+    let h = stunwire.parse(var again)
+    test.assert_eq(h.method, turnwire.TURN_ALLOCATE)
+    test.assert(stunwire.txid_eq(h.txid, id(2)))
+    test.assert(stunwire.text_is(var again, stunwire.find(var again, h, stunwire.STUN_ATTR_USERNAME), "alice"))
+    test.assert(stunwire.text_is(var again, stunwire.find(var again, h, stunwire.STUN_ATTR_REALM), "example.org"))
+    test.assert(stunwire.text_is(var again, stunwire.find(var again, h, stunwire.STUN_ATTR_NONCE), "n1"))
+    test.case("its MESSAGE-INTEGRITY is the HMAC-SHA1 under MD5(alice:example.org:secret)")
+    var key = server_key()
+    test.assert_eq(stunmac.check_integrity(var again, h, var key, false), stunmac.STUN_CHECK_OK)
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATING)
+    test.case("a 401 to the retry ends the allocation, since the credentials were wrong")
+    var r2 = err_reply(var again, 401, "example.org", "n2")
+    let bad = turnsess.on_datagram(var s, var r2, var out, var data, id(3))
+    test.assert_eq(bad.event, turnsess.TURN_EV_FAILED)
+    test.assert_eq(bad.code, 401)
+    test.assert_eq(s.state, turnsess.TURN_FAILED)
+    test.assert_eq(s.last_error, 401)
+
+@test
+fn test_the_success_gives_the_relayed_address_and_the_lifetime() [io]
+    let s = allocated(false)
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATED)
+    test.assert(stunwire.addr_eq(s.relayed, relayed()))
+    test.assert_eq(s.relayed2.family, 0)
+    test.assert(stunwire.addr_eq(s.mapped, mapped()))
+    test.assert_eq(s.lifetime_s, 600)
+    test.assert_eq(s.alloc_left_ms, 600000)
+    test.assert(not s.token.present)
+    test.assert(not s.addr_error.present)
+    test.case("a success whose integrity does not check out is ignored and the timer goes on")
+    var t = turnsess.session("alice", "secret", 0, false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var t, var out, id(1))
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    let _ = turnsess.on_datagram(var t, var r1, var out, var data, id(2))
+    var unsigned = ok_reply(var out, 600, false)
+    test.assert_eq(turnsess.on_datagram(var t, var unsigned, var out, var data, id(3)).event,
+        turnsess.TURN_EV_NONE)
+    test.assert_eq(t.state, turnsess.TURN_ALLOCATING)
+    var forged = ok_reply(var out, 601, true)
+    forged[forged.len() - 1] = (forged[forged.len() - 1] as Int ^ 1) as u8
+    test.assert_eq(turnsess.on_datagram(var t, var forged, var out, var data, id(3)).event, turnsess.TURN_EV_NONE)
+    var good = ok_reply(var out, 600, true)
+    test.assert_eq(turnsess.on_datagram(var t, var good, var out, var data, id(3)).event,
+        turnsess.TURN_EV_ALLOCATED)
+
+@test
+fn test_an_allocate_that_is_answered_wrongly_fails() [io]
+    for kind in [0, 1]
+        var s = turnsess.session("alice", "secret", 0, false)
+        var out: stunwire.StunMsg = Vec.new()
+        var data: stunwire.StunMsg = Vec.new()
+        let _ = turnsess.allocate(var s, var out, id(1))
+        var r1 = err_reply(var out, 401, "example.org", "n1")
+        let _ = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+        let h = stunwire.parse(var out)
+        var m: stunwire.StunMsg = Vec.new()
+        let _ = stunwire.begin(var m, stunwire.STUN_SUCCESS, turnwire.TURN_ALLOCATE, h.txid)
+        if kind == 0
+            let _ = turnwire.add_lifetime(var m, 600)
+        else
+            let _ = stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, relayed(), h.txid, true)
+        var k = server_key()
+        let _ = stunmac.add_integrity(var m, var k, false)
+        test.case("a success with only one of the relayed address and the lifetime")
+        let st = turnsess.on_datagram(var s, var m, var out, var data, id(3))
+        test.assert_eq(st.event, turnsess.TURN_EV_FAILED)
+        test.assert_eq(st.code, turnsess.TURN_ERR_BAD_RESPONSE)
+    test.case("a 401 without a nonce, or without a realm the first time, cannot be answered")
+    for variant in [0, 1]
+        var s = turnsess.session("alice", "secret", 0, false)
+        var out: stunwire.StunMsg = Vec.new()
+        var data: stunwire.StunMsg = Vec.new()
+        let _ = turnsess.allocate(var s, var out, id(1))
+        var realm = "example.org"
+        var nonce = "n1"
+        if variant == 0
+            nonce = ""
+        else
+            realm = ""
+        var r1 = err_reply(var out, 401, realm, nonce)
+        let st = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+        test.assert_eq(st.event, turnsess.TURN_EV_FAILED)
+        test.assert_eq(st.code, turnsess.TURN_ERR_BAD_RESPONSE)
+    test.case("a realm or nonce too long to hold")
+    var long = turnsess.session("alice", "secret", 0, false)
+    var out2: stunwire.StunMsg = Vec.new()
+    var data2: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var long, var out2, id(1))
+    var r3 = err_reply(var out2, 401, "example.org", str.repeat("n", 129))
+    test.assert_eq(turnsess.on_datagram(var long, var r3, var out2, var data2, id(2)).code,
+        turnsess.TURN_ERR_BAD_RESPONSE)
+    var long2 = turnsess.session("alice", "secret", 0, false)
+    let _ = turnsess.allocate(var long2, var out2, id(1))
+    var r4 = err_reply(var out2, 401, str.repeat("r", 129), "n1")
+    test.assert_eq(turnsess.on_datagram(var long2, var r4, var out2, var data2, id(2)).code,
+        turnsess.TURN_ERR_BAD_RESPONSE)
+
+@test
+fn test_every_error_that_is_not_a_challenge_ends_the_allocation() [io]
+    for code in [403, 437, 441, 442, 486, 508, 400, 500]
+        var s = turnsess.session("alice", "secret", 0, false)
+        var out: stunwire.StunMsg = Vec.new()
+        var data: stunwire.StunMsg = Vec.new()
+        let _ = turnsess.allocate(var s, var out, id(1))
+        var r = err_reply(var out, code, "", "")
+        let st = turnsess.on_datagram(var s, var r, var out, var data, id(2))
+        test.assert_eq(st.event, turnsess.TURN_EV_FAILED)
+        test.assert_eq(st.code, code)
+        test.assert_eq(s.last_error, code)
+        test.assert_eq(s.state, turnsess.TURN_FAILED)
+        test.case("a failed session ignores what comes after")
+        test.assert_eq(turnsess.on_datagram(var s, var r, var out, var data, id(3)).event, turnsess.TURN_EV_NONE)
+        test.assert_eq(step_event(var s, 1000), turnsess.TURN_EV_NONE)
+
+@test
+fn test_a_stale_nonce_is_answered_three_times_and_then_fails() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(10)), turnsess.TURN_OK)
+    var current = out
+    for k in 0..3
+        var stale = err_reply(var current, 438, "example.org", "fresh")
+        var again: stunwire.StunMsg = Vec.new()
+        let st = turnsess.on_datagram(var s, var stale, var again, var data, id(11 + k))
+        test.assert_eq(st.event, turnsess.TURN_EV_SEND)
+        let h = stunwire.parse(var again)
+        test.assert(stunwire.txid_eq(h.txid, id(11 + k)))
+        test.assert(stunwire.text_is(var again, stunwire.find(var again, h, stunwire.STUN_ATTR_NONCE), "fresh"))
+        current = again
+    var last = err_reply(var current, 438, "example.org", "fresh")
+    let end = turnsess.on_datagram(var s, var last, var out, var data, id(20))
+    test.assert_eq(end.event, turnsess.TURN_EV_REQUEST_FAILED)
+    test.assert_eq(end.code, 438)
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATED)
+    test.assert(not turnsess.has_permission(var s, peer(1)))
+
+@test
+fn test_the_options_of_the_allocate_are_built_and_refused() [io]
+    test.case("EVEN-PORT with the reserve bit, DONT-FRAGMENT and a lifetime")
+    var s = turnsess.session("alice", "secret", 0, false)
+    var o = turnsess.default_options()
+    o = turnsess.TurnOpts { family: 0,
+        additional_v6: false,
+        even_port: true,
+        reserve_next: true,
+        has_token: false,
+        token: 0,
+        dont_fragment: true,
+        lifetime_s: 1200 }
+    test.assert(turnsess.set_options(var s, o))
+    var out: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    let h = stunwire.parse(var out)
+    test.assert_eq(turnattr.read_even_port(var out, h), 1)
+    test.assert(turnattr.has_dont_fragment(var out, h))
+    test.assert_eq(turnwire.read_lifetime(var out, h), 1200)
+    test.assert_eq(stunwire.count(var out, h, turnwire.TURN_ATTR_RESERVATION_TOKEN), 0)
+    test.case("a RESERVATION-TOKEN instead of EVEN-PORT")
+    var t = turnsess.session("alice", "secret", 0, false)
+    let ot = turnsess.TurnOpts { family: 2,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: false,
+        has_token: true,
+        token: 0xF0E0D0C0B0A09080,
+        dont_fragment: false,
+        lifetime_s: 0 }
+    test.assert(turnsess.set_options(var t, ot))
+    let _ = turnsess.allocate(var t, var out, id(1))
+    let h2 = stunwire.parse(var out)
+    let tok = turnattr.read_token(var out, h2)
+    test.assert(tok.present)
+    test.assert_eq(tok.value, 0xF0E0D0C0B0A09080)
+    test.assert_eq(turnattr.read_requested_family(var out, h2), 2)
+    test.assert_eq(turnattr.read_even_port(var out, h2), -1)
+    test.assert(not turnattr.has_dont_fragment(var out, h2))
+    test.assert_eq(turnwire.read_lifetime(var out, h2), -1)
+    test.case("ADDITIONAL-ADDRESS-FAMILY asks for both families")
+    var u = turnsess.session("alice", "secret", 0, false)
+    let ou = turnsess.TurnOpts { family: 0,
+        additional_v6: true,
+        even_port: true,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: 0 }
+    test.assert(turnsess.set_options(var u, ou))
+    let _ = turnsess.allocate(var u, var out, id(1))
+    let h3 = stunwire.parse(var out)
+    test.assert_eq(turnattr.read_additional_family(var out, h3), 2)
+    test.assert_eq(turnattr.read_requested_family(var out, h3), 0)
+    test.assert_eq(turnattr.read_even_port(var out, h3), 0)
+    test.case("combinations the RFC refuses, a family out of range, and options after the allocate")
+    var v = turnsess.session("alice", "secret", 0, false)
+    test.assert(not turnsess.set_options(var v, turnsess.TurnOpts { family: 1,
+        additional_v6: true,
+        even_port: false,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: 0 }))
+    test.assert(not turnsess.set_options(var v, turnsess.TurnOpts { family: 0,
+        additional_v6: false,
+        even_port: true,
+        reserve_next: false,
+        has_token: true,
+        token: 1,
+        dont_fragment: false,
+        lifetime_s: 0 }))
+    test.assert(not turnsess.set_options(var v, turnsess.TurnOpts { family: 0,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: true,
+        has_token: true,
+        token: 1,
+        dont_fragment: false,
+        lifetime_s: 0 }))
+    test.assert(not turnsess.set_options(var v, turnsess.TurnOpts { family: 3,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: 0 }))
+    test.assert(not turnsess.set_options(var v, turnsess.TurnOpts { family: -1,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: 0 }))
+    test.assert(not turnsess.set_options(var s, o))
+
+@test
+fn test_both_families_a_token_and_an_address_error_are_read_from_the_success() [io]
+    var s = turnsess.session("alice", "secret", 0, false)
+    let ou = turnsess.TurnOpts { family: 0,
+        additional_v6: true,
+        even_port: true,
+        reserve_next: true,
+        has_token: false,
+        token: 0,
+        dont_fragment: false,
+        lifetime_s: 0 }
+    test.assert(turnsess.set_options(var s, ou))
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    let _ = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+    let h = stunwire.parse(var out)
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_SUCCESS, turnwire.TURN_ALLOCATE, h.txid)
+    let _ = stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, relayed(), h.txid, true)
+    let _ = stunwire.add_addr(var m, turnwire.TURN_ATTR_XOR_RELAYED_ADDRESS, relayed6(), h.txid, true)
+    let _ = turnwire.add_lifetime(var m, 300)
+    let _ = turnwire.add_reservation_token(var m, 0x0102030405060708)
+    let _ = turnattr.add_address_error(var m, 2, 508, "Insufficient Capacity")
+    var k = server_key()
+    let _ = stunmac.add_integrity(var m, var k, false)
+    let st = turnsess.on_datagram(var s, var m, var out, var data, id(3))
+    test.assert_eq(st.event, turnsess.TURN_EV_ALLOCATED)
+    test.assert(stunwire.addr_eq(s.relayed, relayed()))
+    test.assert(stunwire.addr_eq(s.relayed2, relayed6()))
+    test.assert(s.token.present)
+    test.assert_eq(s.token.value, 0x0102030405060708)
+    test.assert(s.addr_error.present)
+    test.assert_eq(s.addr_error.family, 2)
+    test.assert_eq(s.addr_error.code, 508)
+    test.assert_eq(s.alloc_left_ms, 300000)
+    test.case("a permission can be asked for a peer of either family")
+    test.assert_eq(turnsess.permit(var s, var out, stunwire.addr_v6(0x20010DB8, 0x1, 80), id(4)),
+        turnsess.TURN_OK)
+    test.assert_eq(turnsess.permit(var s, var out, peer(3), id(5)), turnsess.TURN_OK)
+
+@test
+fn test_retransmission_follows_the_schedule_of_rfc_8489() [io]
+    var s = turnsess.session("alice", "secret", 0, false)
+    var out: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    let first = hex_str(var out)
+    test.case("sends at 0, 500, 1500, 3500, 7500, 15500 and 31500 ms: six repeats, the same bytes each time")
+    var repeats = 0
+    var at = 0
+    var failed = false
+    for _i in 0..80
+        if not failed
+            var again: stunwire.StunMsg = Vec.new()
+            let st = turnsess.tick(var s, 500, var again, id(50))
+            at = at + 500
+            if st.event == turnsess.TURN_EV_RESEND
+                repeats = repeats + 1
+                test.assert_eq(hex_str(var again), first)
+                test.assert(at == 500 or at == 1500 or at == 3500 or at == 7500 or at == 15500 or at == 31500)
+            if st.event == turnsess.TURN_EV_FAILED
+                failed = true
+                test.assert_eq(st.code, turnsess.TURN_ERR_TIMEOUT)
+    test.assert_eq(repeats, 6)
+    test.assert(failed)
+    test.assert_eq(at, 39500)
+    test.assert_eq(s.state, turnsess.TURN_FAILED)
+    test.case("over a reliable transport the request is sent once and fails after 39500 ms")
+    var r = turnsess.session("alice", "secret", 0, true)
+    let _ = turnsess.allocate(var r, var out, id(1))
+    test.assert_eq(step_event(var r, 39000), turnsess.TURN_EV_NONE)
+    test.assert_eq(step_event(var r, 500), turnsess.TURN_EV_FAILED)
+
+fn hex_str(var m: stunwire.StunMsg) -> Str
+    var s = ""
+    for i in 0..m.len()
+        s = s + str.from_int(m[i] as Int) + " "
+    s
+
+@test
+fn test_a_refresh_is_sent_at_half_the_lifetime_and_answered() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(step_event(var s, 299000), turnsess.TURN_EV_NONE)
+    let st = turnsess.tick(var s, 1000, var out, id(10))
+    test.assert_eq(st.event, turnsess.TURN_EV_SEND)
+    let h = stunwire.parse(var out)
+    test.assert_eq(h.method, turnwire.TURN_REFRESH)
+    test.assert(stunwire.txid_eq(h.txid, id(10)))
+    test.assert_eq(turnwire.read_lifetime(var out, h), 600)
+    var key = server_key()
+    test.assert_eq(stunmac.check_integrity(var out, h, var key, false), stunmac.STUN_CHECK_OK)
+    test.case("the session asks once, not at every tick")
+    test.assert_eq(step_event(var s, 100), turnsess.TURN_EV_NONE)
+    test.case("the success gives the new lifetime")
+    var rep = ok_reply(var out, 900, true)
+    let done = turnsess.on_datagram(var s, var rep, var out, var data, id(11))
+    test.assert_eq(done.event, turnsess.TURN_EV_REFRESHED)
+    test.assert_eq(s.lifetime_s, 900)
+    test.assert_eq(s.alloc_left_ms, 900000)
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATED)
+    test.case("the next refresh is due at half of the new lifetime")
+    test.assert_eq(step_event(var s, 450000), turnsess.TURN_EV_SEND)
+
+@test
+fn test_a_refresh_that_fails_or_never_comes_back_ends_the_allocation() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.tick(var s, 300000, var out, id(10))
+    var bad = err_reply(var out, 437, "", "")
+    let st = turnsess.on_datagram(var s, var bad, var out, var data, id(11))
+    test.assert_eq(st.event, turnsess.TURN_EV_FAILED)
+    test.assert_eq(st.code, 437)
+    test.case("a Refresh success with no lifetime")
+    var t = allocated(false)
+    let _ = turnsess.tick(var t, 300000, var out, id(10))
+    let h = stunwire.parse(var out)
+    var m: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var m, stunwire.STUN_SUCCESS, turnwire.TURN_REFRESH, h.txid)
+    var k = server_key()
+    let _ = stunmac.add_integrity(var m, var k, false)
+    test.assert_eq(turnsess.on_datagram(var t, var m, var out, var data, id(11)).code,
+        turnsess.TURN_ERR_BAD_RESPONSE)
+    test.case("a Refresh nobody answers")
+    var u = allocated(false)
+    let _ = turnsess.tick(var u, 300000, var out, id(10))
+    var failed = 0
+    for _i in 0..80
+        let e = step_event(var u, 500)
+        if e == turnsess.TURN_EV_FAILED
+            failed = failed + 1
+    test.assert_eq(failed, 1)
+    test.assert_eq(u.last_error, turnsess.TURN_ERR_TIMEOUT)
+
+@test
+fn test_an_allocation_that_runs_out_before_its_refresh_is_given_up_expires() [io]
+    test.case("a lifetime of 20 seconds: the refresh at 10 is in flight when the allocation ends at 20")
+    var s = allocated_for(20)
+    var tally = no_tally()
+    run_for(var s, var tally, 15, false)
+    test.assert_eq(tally.alloc, 1)
+    test.assert_eq(tally.failed, 0)
+    run_for(var s, var tally, 10, false)
+    test.assert_eq(tally.failed, 1)
+    test.assert_eq(s.state, turnsess.TURN_FAILED)
+    test.assert_eq(s.last_error, turnsess.TURN_ERR_EXPIRED)
+
+@test
+fn test_release_sends_a_refresh_of_zero_and_closes() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    test.assert_eq(turnsess.release(var s, var out, id(6)), turnsess.TURN_OK)
+    test.assert_eq(s.state, turnsess.TURN_CLOSING)
+    let h = stunwire.parse(var out)
+    test.assert_eq(turnwire.read_lifetime(var out, h), 0)
+    test.assert_eq(turnsess.release(var s, var out, id(7)), turnsess.TURN_ERR_STATE)
+    var rep = ok_reply(var out, 0, true)
+    let st = turnsess.on_datagram(var s, var rep, var out, var data, id(8))
+    test.assert_eq(st.event, turnsess.TURN_EV_CLOSED)
+    test.assert_eq(s.state, turnsess.TURN_CLOSED)
+    test.assert(not turnsess.has_permission(var s, peer(1)))
+    test.assert_eq(step_event(var s, 1000000), turnsess.TURN_EV_NONE)
+    test.case("a release that cannot be sent leaves the session allocated")
+    var t = allocated(false)
+    for k in 0..6
+        test.assert_eq(turnsess.permit(var t, var out, peer(k + 1), id(20 + k)), turnsess.TURN_OK)
+    test.assert_eq(turnsess.release(var t, var out, id(30)), turnsess.TURN_ERR_FULL)
+    test.assert_eq(t.state, turnsess.TURN_ALLOCATED)
+    test.case("a closing allocation that is never answered expires")
+    var u = allocated(false)
+    test.assert_eq(turnsess.release(var u, var out, id(6)), turnsess.TURN_OK)
+    var failed = 0
+    for _i in 0..30
+        let st = turnsess.tick(var u, 30000, var out, id(7))
+        if st.event == turnsess.TURN_EV_FAILED
+            failed = failed + 1
+    test.assert(failed >= 1)
+
+@test
+fn test_a_permission_is_asked_for_installed_refreshed_and_expires() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.case("the request names the peer's address and carries credentials")
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    let h = stunwire.parse(var out)
+    test.assert_eq(h.method, turnwire.TURN_CREATE_PERMISSION)
+    test.assert(stunwire.addr_eq(turnwire.read_peer(var out, h), stunwire.addr_v4(192, 0, 2, 1, 0)))
+    var key = server_key()
+    test.assert_eq(stunmac.check_integrity(var out, h, var key, false), stunmac.STUN_CHECK_OK)
+    test.assert(not turnsess.has_permission(var s, peer(1)))
+    test.case("the success installs it, for the address and not the port")
+    let st = confirm(var s, var out)
+    test.assert_eq(st.event, turnsess.TURN_EV_PERMISSION)
+    test.assert(turnsess.has_permission(var s, peer(1)))
+    test.assert(turnsess.has_permission(var s, stunwire.addr_v4(192, 0, 2, 1, 9999)))
+    test.assert(not turnsess.has_permission(var s, peer(2)))
+    test.case("asking again with time left is not needed")
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(6)), turnsess.TURN_ALREADY)
+    test.case("after 240 seconds, 60 are left and the session asks again by itself")
+    test.assert_eq(step_event(var s, 239000), turnsess.TURN_EV_NONE)
+    let again = turnsess.tick(var s, 1000, var out, id(7))
+    test.assert_eq(again.event, turnsess.TURN_EV_SEND)
+    test.assert_eq(stunwire.parse(var out).method, turnwire.TURN_CREATE_PERMISSION)
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(8)), turnsess.TURN_OK)
+    test.case("a permission that was asked for is renewed with the full time")
+    let ok = turnsess.tick(var s, 0, var out, id(9))
+    test.assert_eq(ok.event, turnsess.TURN_EV_NONE)
+    var req = out
+    let got = confirm(var s, var req)
+    test.assert_eq(got.event, turnsess.TURN_EV_PERMISSION)
+    test.assert_eq(s.perms[0].left_ms, 300000)
+    test.case("a permission whose renewals are lost is asked for again, and then expires")
+    var lost = allocated_for(3600)
+    test.assert_eq(turnsess.permit(var lost, var out, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var lost, var out)
+    var tally = no_tally()
+    run_for(var lost, var tally, 295, false)
+    test.assert_eq(tally.expired, 0)
+    test.assert_eq(tally.perm, 1)
+    run_for(var lost, var tally, 10, false)
+    test.assert_eq(tally.expired, 1)
+    test.assert_eq(tally.expired_channel, 0)
+    test.assert(not turnsess.has_permission(var lost, peer(1)))
+    test.case("each lost renewal is reported once it has run out of time")
+    run_for(var lost, var tally, 60, false)
+    test.assert(tally.request_failed >= 1)
+
+@test
+fn test_the_permission_table_and_its_refusals() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    test.case("a peer of the other family than the relayed address")
+    test.assert_eq(turnsess.permit(var s, var out, stunwire.addr_v6(1, 2, 3), id(5)), turnsess.TURN_ERR_FAMILY)
+    test.assert_eq(turnsess.permit(var s, var out, stunwire.StunAddr { family: 0, port: 0, hi: 0, lo: 0 }, id(5)),
+        turnsess.TURN_ERR_FAMILY)
+    test.case("eight permissions, and then no room")
+    for k in 0..6
+        test.assert_eq(turnsess.permit(var s, var out, peer(k + 1), id(10 + k)), turnsess.TURN_OK)
+    test.assert_eq(turnsess.permit(var s, var out, peer(7), id(20)), turnsess.TURN_ERR_FULL)
+    test.case("six requests are in flight; when they are answered the table has room again")
+    for k in 0..6
+        var req: stunwire.StunMsg = Vec.new()
+        let _ = turnsess.permit(var s, var req, peer(k + 1), id(30 + k))
+    test.assert_eq(step_event(var s, 0), turnsess.TURN_EV_NONE)
+
+@test
+fn test_a_full_permission_table_refuses_a_ninth_peer() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    for k in 0..8
+        test.assert_eq(turnsess.permit(var s, var out, peer(k + 1), id(10 + k)), turnsess.TURN_OK)
+        let _ = confirm(var s, var out)
+    test.assert_eq(turnsess.permit(var s, var out, peer(9), id(30)), turnsess.TURN_ERR_FULL)
+    test.assert_eq(turnsess.permit(var s, var out, peer(8), id(31)), turnsess.TURN_ALREADY)
+    test.case("forgetting one makes room")
+    turnsess.forget(var s, peer(3))
+    test.assert(not turnsess.has_permission(var s, peer(3)))
+    test.assert_eq(turnsess.permit(var s, var out, peer(9), id(32)), turnsess.TURN_OK)
+
+@test
+fn test_a_permission_request_that_fails_frees_its_row() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    var r = err_reply(var out, 403, "", "")
+    let st = turnsess.on_datagram(var s, var r, var out, var data, id(6))
+    test.assert_eq(st.event, turnsess.TURN_EV_REQUEST_FAILED)
+    test.assert_eq(st.code, 403)
+    test.assert(stunwire.addr_eq(st.peer, stunwire.addr_v4(192, 0, 2, 1, 0)))
+    test.assert_eq(s.state, turnsess.TURN_ALLOCATED)
+    test.assert(not turnsess.has_permission(var s, peer(1)))
+    test.case("and one that nobody answers")
+    test.assert_eq(turnsess.permit(var s, var out, peer(2), id(7)), turnsess.TURN_OK)
+    var failed = 0
+    for _i in 0..80
+        let e = turnsess.tick(var s, 500, var out, id(8))
+        if e.event == turnsess.TURN_EV_REQUEST_FAILED and e.code == turnsess.TURN_ERR_TIMEOUT
+            failed = failed + 1
+    test.assert_eq(failed, 1)
+
+@test
+fn test_a_channel_is_bound_with_its_permission_and_carries_data() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let ch = turnsess.free_channel(var s)
+    test.assert_eq(ch, 0x4000)
+    test.assert_eq(turnsess.bind_channel(var s, var out, ch, peer(1), id(5)), turnsess.TURN_OK)
+    let h = stunwire.parse(var out)
+    test.assert_eq(h.method, turnwire.TURN_CHANNEL_BIND)
+    test.assert_eq(turnattr.read_channel_number(var out, h), 0x4000)
+    test.assert(stunwire.addr_eq(turnwire.read_peer(var out, h), peer(1)))
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0x4000)
+    test.assert_eq(turnsess.free_channel(var s), 0x4001)
+    test.case("the success binds it and installs the permission of its peer")
+    let st = confirm(var s, var out)
+    test.assert_eq(st.event, turnsess.TURN_EV_BOUND)
+    test.assert_eq(st.code, 0x4000)
+    test.assert(stunwire.addr_eq(st.peer, peer(1)))
+    test.assert(turnsess.has_permission(var s, peer(1)))
+    test.case("data to the peer goes in ChannelData: four bytes of header and the data")
+    var src: stunwire.StunMsg = Vec.new()
+    for b in [1, 2, 3]
+        let _ = src.push(b as u8)
+    var wire: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var src, 0, 3, id(6)), turnsess.TURN_SENT_CHANNEL)
+    test.assert_eq(wire.len(), 7)
+    test.assert_eq(wire[0] as Int, 0x40)
+    test.assert_eq(wire[3] as Int, 3)
+    test.case("ChannelData that comes back is delivered with its peer")
+    var inbound: stunwire.StunMsg = Vec.new()
+    let _ = turnwire.channel_data(var inbound, 0x4000, var src, 1, 2, false)
+    let got = turnsess.on_datagram(var s, var inbound, var out, var data, id(7))
+    test.assert_eq(got.event, turnsess.TURN_EV_DATA)
+    test.assert_eq(got.n, 2)
+    test.assert_eq(got.code, 0x4000)
+    test.assert(stunwire.addr_eq(got.peer, peer(1)))
+    test.assert_eq(data.len(), 2)
+    test.assert_eq(data[0] as Int, 2)
+    test.case("a channel that is not bound is dropped, and so is a malformed frame")
+    var other: stunwire.StunMsg = Vec.new()
+    let _ = turnwire.channel_data(var other, 0x4005, var src, 0, 3, false)
+    test.assert_eq(turnsess.on_datagram(var s, var other, var out, var data, id(8)).event, turnsess.TURN_EV_NONE)
+    var cut: stunwire.StunMsg = Vec.new()
+    let _ = turnwire.channel_data(var cut, 0x4000, var src, 0, 3, false)
+    let _ = cut.pop()
+    test.assert_eq(turnsess.on_datagram(var s, var cut, var out, var data, id(9)).event, turnsess.TURN_EV_NONE)
+
+@test
+fn test_channel_data_over_a_stream_is_padded() [io]
+    var s = allocated(true)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4001, peer(2), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var src: stunwire.StunMsg = Vec.new()
+    for b in [9, 8, 7, 6, 5]
+        let _ = src.push(b as u8)
+    var wire: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(2), var src, 0, 5, id(6)), turnsess.TURN_SENT_CHANNEL)
+    test.assert_eq(wire.len(), 12)
+    test.assert_eq(wire[3] as Int, 5)
+    test.assert_eq(wire[11] as Int, 0)
+
+@test
+fn test_data_to_a_peer_without_a_channel_goes_in_a_send_indication() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var src: stunwire.StunMsg = Vec.new()
+    for b in [1, 2, 3, 4]
+        let _ = src.push(b as u8)
+    var wire: stunwire.StunMsg = Vec.new()
+    test.case("without a permission the server would drop the data, so nothing is sent")
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var src, 0, 4, id(6)),
+        turnsess.TURN_ERR_PERMISSION)
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    test.case("with one, a Send indication carries the peer and the data")
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var src, 0, 4, id(7)),
+        turnsess.TURN_SENT_INDICATION)
+    let h = stunwire.parse(var wire)
+    test.assert_eq(h.class, stunwire.STUN_INDICATION)
+    test.assert_eq(h.method, turnwire.TURN_SEND)
+    test.assert(stunwire.addr_eq(turnwire.read_peer(var wire, h), peer(1)))
+    test.assert_eq(turnwire.find_data(var wire, h).len, 4)
+    test.assert(not turnattr.has_dont_fragment(var wire, h))
+    test.case("data that does not fit is refused")
+    var big: stunwire.StunMsg = Vec.new()
+    for _i in 0..1270
+        let _ = big.push(7 as u8)
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var big, 0, 1270, id(8)),
+        turnsess.TURN_ERR_TOO_BIG)
+    test.case("a channel that is being bound does not carry data yet")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4002, peer(1), id(9)), turnsess.TURN_OK)
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var src, 0, 4, id(10)),
+        turnsess.TURN_SENT_INDICATION)
+
+@test
+fn test_dont_fragment_follows_the_options_and_too_big_channel_data_is_refused() [io]
+    var s = turnsess.session("alice", "secret", 0, false)
+    let o = turnsess.TurnOpts { family: 0,
+        additional_v6: false,
+        even_port: false,
+        reserve_next: false,
+        has_token: false,
+        token: 0,
+        dont_fragment: true,
+        lifetime_s: 0 }
+    test.assert(turnsess.set_options(var s, o))
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    let _ = turnsess.allocate(var s, var out, id(1))
+    var r1 = err_reply(var out, 401, "example.org", "n1")
+    let _ = turnsess.on_datagram(var s, var r1, var out, var data, id(2))
+    var r2 = ok_reply(var out, 600, true)
+    let _ = turnsess.on_datagram(var s, var r2, var out, var data, id(3))
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var src: stunwire.StunMsg = Vec.new()
+    let _ = src.push(1 as u8)
+    var wire: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var src, 0, 1, id(7)),
+        turnsess.TURN_SENT_INDICATION)
+    test.assert(turnattr.has_dont_fragment(var wire, stunwire.parse(var wire)))
+    test.case("an indication that fills the message has no room for DONT-FRAGMENT")
+    var big: stunwire.StunMsg = Vec.new()
+    for _i in 0..1244
+        let _ = big.push(7 as u8)
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var big, 0, 1244, id(8)),
+        turnsess.TURN_ERR_TOO_BIG)
+    test.case("ChannelData that does not fit")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(9)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var huge: stunwire.StunMsg = Vec.new()
+    for _i in 0..1277
+        let _ = huge.push(7 as u8)
+    test.assert_eq(turnsess.send_data(var s, var wire, peer(1), var huge, 0, 1277, id(10)),
+        turnsess.TURN_ERR_TOO_BIG)
+
+@test
+fn test_data_arrives_in_indications_only_from_a_peer_with_a_permission() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var src: stunwire.StunMsg = Vec.new()
+    for b in [5, 6, 7]
+        let _ = src.push(b as u8)
+    var ind: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var ind, stunwire.STUN_INDICATION, turnwire.TURN_DATA, id(40))
+    let _ = turnwire.add_peer(var ind, peer(1), id(40))
+    let _ = turnwire.add_data(var ind, var src, 0, 3)
+    let got = turnsess.on_datagram(var s, var ind, var out, var data, id(41))
+    test.assert_eq(got.event, turnsess.TURN_EV_DATA)
+    test.assert_eq(got.n, 3)
+    test.assert_eq(got.code, 0)
+    test.assert(stunwire.addr_eq(got.peer, peer(1)))
+    test.assert_eq(data[2] as Int, 7)
+    test.case("from a peer with no permission")
+    var stranger: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var stranger, stunwire.STUN_INDICATION, turnwire.TURN_DATA, id(42))
+    let _ = turnwire.add_peer(var stranger, peer(2), id(42))
+    let _ = turnwire.add_data(var stranger, var src, 0, 3)
+    test.assert_eq(turnsess.on_datagram(var s, var stranger, var out, var data, id(43)).event,
+        turnsess.TURN_EV_NONE)
+    test.case("with no peer, and with no data")
+    var nopeer: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var nopeer, stunwire.STUN_INDICATION, turnwire.TURN_DATA, id(44))
+    let _ = turnwire.add_data(var nopeer, var src, 0, 3)
+    test.assert_eq(turnsess.on_datagram(var s, var nopeer, var out, var data, id(45)).event,
+        turnsess.TURN_EV_NONE)
+    var nodata: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var nodata, stunwire.STUN_INDICATION, turnwire.TURN_DATA, id(46))
+    let _ = turnwire.add_peer(var nodata, peer(1), id(46))
+    test.assert_eq(turnsess.on_datagram(var s, var nodata, var out, var data, id(47)).event,
+        turnsess.TURN_EV_NONE)
+    test.case("an ICMP attribute in place of the data reports why a datagram was dropped")
+    var icmp: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var icmp, stunwire.STUN_INDICATION, turnwire.TURN_DATA, id(48))
+    let _ = turnwire.add_peer(var icmp, peer(1), id(48))
+    let _ = turnattr.add_icmp(var icmp, 3, 4, 1400)
+    let ev = turnsess.on_datagram(var s, var icmp, var out, var data, id(49))
+    test.assert_eq(ev.event, turnsess.TURN_EV_ICMP)
+    test.assert_eq(ev.code, 3 * 256 + 4)
+    test.assert(stunwire.addr_eq(ev.peer, peer(1)))
+    test.case("a Send indication from the server, and other indications, are not data")
+    var send: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var send, stunwire.STUN_INDICATION, turnwire.TURN_SEND, id(50))
+    test.assert_eq(turnsess.on_datagram(var s, var send, var out, var data, id(51)).event, turnsess.TURN_EV_NONE)
+
+@test
+fn test_datagrams_that_are_not_for_the_session_are_ignored() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.case("garbage, a response nobody asked for, a request, and a response of no class we know")
+    var junk: stunwire.StunMsg = Vec.new()
+    for _i in 0..30
+        let _ = junk.push(0x55 as u8)
+    test.assert_eq(turnsess.on_datagram(var s, var junk, var out, var data, id(60)).event, turnsess.TURN_EV_NONE)
+    var stray: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var stray, stunwire.STUN_SUCCESS, turnwire.TURN_REFRESH, id(61))
+    test.assert_eq(turnsess.on_datagram(var s, var stray, var out, var data, id(62)).event, turnsess.TURN_EV_NONE)
+    test.assert_eq(turnsess.permit(var s, var out, peer(1), id(63)), turnsess.TURN_OK)
+    var request = out
+    let h = stunwire.parse(var request)
+    var as_request: stunwire.StunMsg = Vec.new()
+    let _ = stunwire.begin(var as_request, stunwire.STUN_REQUEST, turnwire.TURN_CREATE_PERMISSION, h.txid)
+    test.assert_eq(turnsess.on_datagram(var s, var as_request, var out, var data, id(64)).event,
+        turnsess.TURN_EV_NONE)
+    test.case("an idle session, and a closed one")
+    var idle = turnsess.session("alice", "secret", 0, false)
+    test.assert_eq(turnsess.on_datagram(var idle, var junk, var out, var data, id(65)).event,
+        turnsess.TURN_EV_NONE)
+    var empty: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.on_datagram(var s, var empty, var out, var data, id(66)).event, turnsess.TURN_EV_NONE)
+
+@test
+fn test_channel_numbers_and_peers_are_held_by_one_binding() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x3FFF, peer(1), id(5)), turnsess.TURN_ERR_RANGE)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x5000, peer(1), id(5)), turnsess.TURN_ERR_RANGE)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, stunwire.addr_v6(1, 2, 3), id(5)),
+        turnsess.TURN_ERR_FAMILY)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(6)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    test.case("the same number for another peer, and the same peer under another number")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(2), id(7)), turnsess.TURN_ERR_CONFLICT)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4001, peer(1), id(8)), turnsess.TURN_ERR_CONFLICT)
+    test.case("the same pair again refreshes the binding")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(9)), turnsess.TURN_OK)
+    test.case("eight channels and then no room")
+    for k in 1..8
+        test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000 + k, peer(k + 1), id(20 + k)),
+            turnsess.TURN_OK)
+        let _ = confirm(var s, var out)
+    test.assert_eq(turnsess.free_channel(var s), 0x4008)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4008, peer(9), id(40)), turnsess.TURN_ERR_FULL)
+
+@test
+fn test_the_requests_in_flight_have_six_places() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    for k in 0..6
+        test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000 + k, peer(k + 1), id(10 + k)),
+            turnsess.TURN_OK)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4006, peer(7), id(30)), turnsess.TURN_ERR_FULL)
+    test.assert_eq(turnsess.permit(var s, var out, peer(7), id(31)), turnsess.TURN_ERR_FULL)
+    test.assert_eq(turnsess.channel_of(s, peer(7)), 0)
+    test.case("each of them is retransmitted on its own")
+    var resends = 0
+    for _i in 0..8
+        let e = turnsess.tick(var s, 500, var out, id(32))
+        if e.event == turnsess.TURN_EV_RESEND
+            resends = resends + 1
+        let more = turnsess.tick(var s, 0, var out, id(33))
+        if more.event == turnsess.TURN_EV_RESEND
+            resends = resends + 1
+    test.assert(resends >= 6)
+
+@test
+fn test_the_permission_is_renewed_at_240_seconds_and_the_channel_at_540() [io]
+    var s = allocated_for(3600)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var t = no_tally()
+    run_for(var s, var t, 235, true)
+    test.assert_eq(t.perm, 0)
+    run_for(var s, var t, 10, true)
+    test.assert_eq(t.perm, 1)
+    run_for(var s, var t, 290, true)
+    test.assert_eq(t.bind, 0)
+    run_for(var s, var t, 10, true)
+    test.assert_eq(t.bind, 1)
+    test.assert_eq(t.expired, 0)
+    test.assert_eq(t.alloc, 0)
+    test.assert_eq(t.failed, 0)
+    test.case("the allocation is renewed at half its lifetime")
+    run_for(var s, var t, 1300, true)
+    test.assert_eq(t.alloc, 1)
+
+@test
+fn test_an_expired_channel_is_quarantined_and_then_free() [io]
+    var s = allocated_for(3600)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var t = no_tally()
+    run_for(var s, var t, 595, false)
+    test.assert_eq(t.expired_channel, 0)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0x4000)
+    run_for(var s, var t, 10, false)
+    test.case("the channel is unbound, and its number and peer stay reserved")
+    test.assert_eq(t.expired_channel, 1)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(2), id(6)), turnsess.TURN_ERR_CONFLICT)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4001, peer(1), id(7)), turnsess.TURN_ERR_CONFLICT)
+    run_for(var s, var t, 290, false)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(2), id(6)), turnsess.TURN_ERR_CONFLICT)
+    test.case("five minutes after it expired they are free")
+    run_for(var s, var t, 10, false)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(2), id(8)), turnsess.TURN_OK)
+
+@test
+fn test_a_quarantined_channel_blocks_other_bindings_until_five_minutes_pass() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    turnsess.forget(var s, peer(1))
+    test.case("forgetting a bound channel reserves it for what is left of it and 5 minutes more")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(2), id(6)), turnsess.TURN_ERR_CONFLICT)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4001, peer(1), id(7)), turnsess.TURN_ERR_CONFLICT)
+    test.assert_eq(turnsess.free_channel(var s), 0x4001)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0)
+    test.case("the same pair may be bound again at once")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(8)), turnsess.TURN_OK)
+    var rep = ok_reply(var out, 600, true)
+    let st = turnsess.on_datagram(var s, var rep, var out, var data, id(9))
+    test.assert_eq(st.event, turnsess.TURN_EV_BOUND)
+    test.case("a pending channel that is forgotten is free at once")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4005, peer(5), id(10)), turnsess.TURN_OK)
+    turnsess.forget(var s, peer(5))
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4006, peer(5), id(11)), turnsess.TURN_OK)
+
+@test
+fn test_a_channel_bind_that_fails_frees_its_row_and_a_400_ends_the_allocation() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(5)), turnsess.TURN_OK)
+    var r = err_reply(var out, 403, "", "")
+    let st = turnsess.on_datagram(var s, var r, var out, var data, id(6))
+    test.assert_eq(st.event, turnsess.TURN_EV_REQUEST_FAILED)
+    test.assert_eq(st.code, 403)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0)
+    test.case("RFC 8656 section 12.3: a 400 means the two ends disagree, so start afresh")
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(7)), turnsess.TURN_OK)
+    var r2 = err_reply(var out, 400, "", "")
+    let st2 = turnsess.on_datagram(var s, var r2, var out, var data, id(8))
+    test.assert_eq(st2.event, turnsess.TURN_EV_FAILED)
+    test.assert_eq(st2.code, 400)
+    test.assert_eq(s.state, turnsess.TURN_FAILED)
+
+@test
+fn test_a_channel_refresh_that_fails_leaves_the_binding_until_it_runs_out() [io]
+    var s = allocated_for(3600)
+    var out: stunwire.StunMsg = Vec.new()
+    var data: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4000, peer(1), id(5)), turnsess.TURN_OK)
+    let _ = confirm(var s, var out)
+    var t = no_tally()
+    run_for(var s, var t, 535, false)
+    test.assert_eq(t.bind, 0)
+    test.case("the server refuses the refresh, and the binding is still the one the server holds")
+    var r: stunwire.StunMsg = Vec.new()
+    var seen = 0
+    for k in 0..10
+        let e = turnsess.tick(var s, 1000, var r, id(90 + k))
+        if e.event == turnsess.TURN_EV_SEND and stunwire.parse(var r).method == turnwire.TURN_CHANNEL_BIND
+            var no = err_reply(var r, 508, "", "")
+            let f = turnsess.on_datagram(var s, var no, var r, var data, id(150 + k))
+            if f.event == turnsess.TURN_EV_REQUEST_FAILED
+                seen = seen + 1
+    test.assert_eq(seen, 1)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0x4000)
+    test.case("it asks again 30 seconds later, not at every tick")
+    var again = 0
+    for k in 0..40
+        let e = turnsess.tick(var s, 1000, var r, id(190 + k))
+        if e.event == turnsess.TURN_EV_SEND and stunwire.parse(var r).method == turnwire.TURN_CHANNEL_BIND
+            again = again + 1
+            var ok = ok_reply(var r, 3600, true)
+            let f = turnsess.on_datagram(var s, var ok, var r, var data, id(250 + k))
+            test.assert_eq(f.event, turnsess.TURN_EV_BOUND)
+    test.assert_eq(again, 1)
+
+@test
+fn test_the_helpers_find_rows_by_number_and_by_peer() [io]
+    var s = allocated(false)
+    var out: stunwire.StunMsg = Vec.new()
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0)
+    test.assert_eq(turnsess.TURN_SLOTS, 6)
+    test.assert_eq(turnsess.TURN_PERMS, 8)
+    test.assert_eq(turnsess.TURN_CHANS, 8)
+    test.assert_eq(turnsess.bind_channel(var s, var out, 0x4003, peer(1), id(5)), turnsess.TURN_OK)
+    test.assert_eq(turnsess.channel_of(s, peer(1)), 0x4003)
+    test.assert_eq(turnsess.channel_of(s, peer(2)), 0)
+    test.assert_eq(turnsess.free_channel(var s), 0x4000)
